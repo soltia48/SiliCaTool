@@ -216,7 +216,7 @@ class FelicaClient(private val tag: Tag) {
             return emptyList()
         }
         val blocks = mutableListOf<ByteArray>()
-        var offset = 12
+        var offset = 13
         while (offset + BLOCK_SIZE <= response.size && blocks.size < blockNumbers.size) {
             blocks += response.copyOfRange(offset, offset + BLOCK_SIZE)
             offset += BLOCK_SIZE
