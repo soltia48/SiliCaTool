@@ -256,8 +256,11 @@ class FelicaClient(private val tag: Tag) {
 
     private fun buildIdmBlock(idm: ByteArray, pmm: ByteArray): ByteArray {
         val result = ByteArray(BLOCK_SIZE) { 0x00 }
+        val clampedPmm = ByteArray(8) { 0xFF.toByte() }
+        val pmmLength = min(pmm.size, 2)
         System.arraycopy(idm, 0, result, 0, min(idm.size, 8))
-        System.arraycopy(pmm, 0, result, 8, min(pmm.size, 8))
+        System.arraycopy(pmm, 0, clampedPmm, 0, pmmLength)
+        System.arraycopy(clampedPmm, 0, result, 8, clampedPmm.size)
         return result
     }
 
