@@ -13,6 +13,7 @@ private const val MAX_SERVICE_CODES = 4
 private const val READ_MAX_BLOCKS = 0xFFFF
 private const val WRITE_MAX_BLOCKS = 12
 private const val SERVICE_CODE_SYSTEM_BLOCK = 0xFFFF
+private const val DEFAULT_TIMEOUT_MS = 1000
 private val DEFAULT_PMM = byteArrayOf(
     0x00,
     0x01,
@@ -27,7 +28,7 @@ private const val LOG_TAG = "FelicaClient"
 
 sealed interface SearchServiceResult {
     data class Service(val code: Int) : SearchServiceResult
-    data class AreaSkip(val areaCode: Int, val endIndex: Int) : SearchServiceResult
+    data class Area(val areaCode: Int, val endIndex: Int) : SearchServiceResult
     data object End : SearchServiceResult
 }
 
@@ -36,71 +37,32 @@ class FelicaClient(private val tag: Tag) {
         NfcF.get(tag) ?: throw IllegalStateException("NFC-F に対応していないタグです")
 
     fun readCard(): CardDump {
-        nfcF.connect()
-        try {
-            val initialIdm = tag.id
-            val initialPmm = DEFAULT_PMM
+        return withConnection {
+            val (initialIdm, initialPmm) = pollSystem(0xFFFF)
+                ?: throw IOException("IDm/PMm の取得に失敗しました")
 
-            val systemCodes = requestSystemCodes(initialIdm).ifEmpty { listOf(0xFFFF) }
+            val systemCodes = requestSystemCodes(initialIdm)
 
             val systems = mutableListOf<SystemDump>()
             var primaryIdm = initialIdm
             var primaryPmm = initialPmm
 
             systemCodes.forEachIndexed { idx, systemCode ->
-                val polled = pollSystem(systemCode)
-                val idmForSystem = polled?.first ?: initialIdm
-                val pmmForSystem = polled?.second ?: initialPmm
+                val (idmForSystem, pmmForSystem) = pollSystem(systemCode)
+                    ?: (initialIdm to initialPmm)
                 if (idx == 0) {
                     primaryIdm = idmForSystem
                     primaryPmm = pmmForSystem
                 }
-
-                val services = discoverServices(idmForSystem)
-                val serviceDumps = services
-                    .groupBy { it ushr 6 }
-                    .map { (serviceNumber, codes) ->
-                        val primary = codes.firstOrNull { it and 0x1 == 0x1 } ?: codes.first()
-                        val blocks = readAvailableBlocks(idmForSystem, primary)
-                        val blockCount = blocks.size
-                        val error =
-                            if (blocks.isEmpty()) "ブロック情報が取得できませんでした" else null
-                        ServiceDump(
-                            serviceNumber = serviceNumber,
-                            primaryServiceCode = primary,
-                            serviceCodes = codes.sorted(),
-                            systemCode = systemCode,
-                            blockCount = blockCount,
-                            blocks = blocks,
-                            error = error,
-                        )
-                    }
-                    .filter {
-                        val keep = it.blocks.isNotEmpty()
-                        if (!keep) {
-                            Log.d(
-                                LOG_TAG,
-                                "サービス番号 0x${it.serviceNumber.toString(16)} を除外: ブロックなし"
-                            )
-                        }
-                        keep
-                    }
-
-                systems += SystemDump(systemCode, idmForSystem, pmmForSystem, serviceDumps)
+                systems += buildSystemDump(idmForSystem, pmmForSystem, systemCode)
             }
 
-            return CardDump(idm = primaryIdm, pmm = primaryPmm, systems = systems)
-        } finally {
-            try {
-                nfcF.close()
-            } catch (_: Exception) {
-            }
+            CardDump(idm = primaryIdm, pmm = primaryPmm, systems = systems)
         }
     }
 
     fun writeSiliCa(image: SiliCaImage) {
-        nfcF.connect()
-        try {
+        withConnection {
             val idm = tag.id
             if (idm.size != 8) throw IOException("IDm 長が不正です")
             writeBlock(idm, 0x83, buildIdmBlock(image.idm, image.pmm))
@@ -112,11 +74,6 @@ class FelicaClient(private val tag: Tag) {
                     throw IOException("ブロック${index}のサイズが16バイトではありません")
                 }
                 writeBlock(idm, index, bytes)
-            }
-        } finally {
-            try {
-                nfcF.close()
-            } catch (_: Exception) {
             }
         }
     }
@@ -142,16 +99,7 @@ class FelicaClient(private val tag: Tag) {
         }
         val count = response[10].toInt() and 0xFF
         if (count == 0) return emptyList()
-        val codes = mutableListOf<Int>()
-        var offset = 11
-        repeat(count) {
-            if (offset + 1 >= response.size) return@repeat
-            val value =
-                ((response[offset].toInt() and 0xFF) shl 8) or (response[offset + 1].toInt() and 0xFF)
-            codes += value
-            offset += 2
-        }
-        return codes
+        return parseUShorts(response, offset = 11, count = count)
     }
 
     private fun discoverServices(idm: ByteArray): List<Int> {
@@ -171,7 +119,7 @@ class FelicaClient(private val tag: Tag) {
                     }
                 }
 
-                is SearchServiceResult.AreaSkip -> {
+                is SearchServiceResult.Area -> {
                     Log.d(
                         LOG_TAG,
                         "SearchServiceCode area=0x${result.areaCode.toString(16)} end=0x${
@@ -189,14 +137,23 @@ class FelicaClient(private val tag: Tag) {
         return services
     }
 
-    private fun readAvailableBlocks(idm: ByteArray, serviceCode: Int): List<BlockData> {
-        val blocks = mutableListOf<BlockData>()
-        for (blockNumber in 0 until READ_MAX_BLOCKS) {
-            val result = readWithoutEncryption(idm, serviceCode, listOf(blockNumber))
-            if (result.isEmpty()) break
-            blocks += BlockData(blockNumber, result.first())
-        }
-        return blocks
+    private fun buildSystemDump(
+        idmForSystem: ByteArray,
+        pmmForSystem: ByteArray,
+        systemCode: Int
+    ): SystemDump {
+        val services = discoverServices(idmForSystem)
+            .groupBy { it ushr 6 }
+            .mapNotNull { (serviceNumber, codes) ->
+                buildServiceDump(
+                    idm = idmForSystem,
+                    systemCode = systemCode,
+                    serviceNumber = serviceNumber,
+                    codes = codes.sorted()
+                )
+            }
+
+        return SystemDump(systemCode, idmForSystem, pmmForSystem, services)
     }
 
     private fun readWithoutEncryption(
@@ -215,13 +172,7 @@ class FelicaClient(private val tag: Tag) {
         if (sf1 != 0 || sf2 != 0) {
             return emptyList()
         }
-        val blocks = mutableListOf<ByteArray>()
-        var offset = 13
-        while (offset + BLOCK_SIZE <= response.size && blocks.size < blockNumbers.size) {
-            blocks += response.copyOfRange(offset, offset + BLOCK_SIZE)
-            offset += BLOCK_SIZE
-        }
-        return blocks
+        return parseBlocks(response, 13, blockNumbers.size)
     }
 
     private fun searchServiceCode(idm: ByteArray, serviceIndex: Int): SearchServiceResult? {
@@ -247,11 +198,47 @@ class FelicaClient(private val tag: Tag) {
                     (payload[0].toInt() and 0xFF) or ((payload[1].toInt() and 0xFF) shl 8)
                 val endIndex =
                     (payload[2].toInt() and 0xFF) or ((payload[3].toInt() and 0xFF) shl 8)
-                SearchServiceResult.AreaSkip(areaCode, endIndex)
+                SearchServiceResult.Area(areaCode, endIndex)
             }
 
             else -> null
         }
+    }
+
+    private fun buildServiceDump(
+        idm: ByteArray,
+        systemCode: Int,
+        serviceNumber: Int,
+        codes: List<Int>,
+    ): ServiceDump? {
+        val primary = codes.firstOrNull { it and 0x1 == 0x1 } ?: codes.firstOrNull() ?: return null
+        val blocks = readAvailableBlocks(idm, primary)
+        if (blocks.isEmpty()) {
+            Log.d(
+                LOG_TAG,
+                "サービス番号 0x${serviceNumber.toString(16)} を除外: ブロックなし"
+            )
+            return null
+        }
+        return ServiceDump(
+            serviceNumber = serviceNumber,
+            primaryServiceCode = primary,
+            serviceCodes = codes,
+            systemCode = systemCode,
+            blockCount = blocks.size,
+            blocks = blocks,
+            error = null,
+        )
+    }
+
+    private fun readAvailableBlocks(idm: ByteArray, serviceCode: Int): List<BlockData> {
+        val blocks = mutableListOf<BlockData>()
+        for (blockNumber in 0 until READ_MAX_BLOCKS) {
+            val result = readWithoutEncryption(idm, serviceCode, listOf(blockNumber))
+            if (result.isEmpty()) break
+            blocks += BlockData(blockNumber, result.first())
+        }
+        return blocks
     }
 
     private fun buildIdmBlock(idm: ByteArray, pmm: ByteArray): ByteArray {
@@ -359,8 +346,8 @@ class FelicaClient(private val tag: Tag) {
         body[0] = 0x00
         body[1] = ((systemCode shr 8) and 0xFF).toByte()
         body[2] = (systemCode and 0xFF).toByte()
-        body[3] = 0x01
-        body[4] = 0x0F
+        body[3] = 0x00
+        body[4] = 0x00
         val frame = addLength(body)
         val response = transceive(frame)
         if (response.size < 18 || response[1].toInt() != 0x01) {
@@ -378,11 +365,47 @@ class FelicaClient(private val tag: Tag) {
         return frame
     }
 
-    private fun transceive(frame: ByteArray, timeoutMs: Int = 500): ByteArray {
+    private fun transceive(frame: ByteArray, timeoutMs: Int = DEFAULT_TIMEOUT_MS): ByteArray {
         nfcF.timeout = timeoutMs
         Log.d(LOG_TAG, "TX (${frame.size}B): ${frame.toHexString()}")
         val response = nfcF.transceive(frame)
         Log.d(LOG_TAG, "RX (${response.size}B): ${response.toHexString()}")
         return response
+    }
+
+    private inline fun <T> withConnection(block: () -> T): T {
+        nfcF.connect()
+        return try {
+            block()
+        } finally {
+            runCatching { nfcF.close() }
+        }
+    }
+
+    private fun parseBlocks(
+        response: ByteArray,
+        offsetStart: Int,
+        expectedBlocks: Int
+    ): List<ByteArray> {
+        val blocks = mutableListOf<ByteArray>()
+        var offset = offsetStart
+        while (offset + BLOCK_SIZE <= response.size && blocks.size < expectedBlocks) {
+            blocks += response.copyOfRange(offset, offset + BLOCK_SIZE)
+            offset += BLOCK_SIZE
+        }
+        return blocks
+    }
+
+    private fun parseUShorts(response: ByteArray, offset: Int, count: Int): List<Int> {
+        val codes = mutableListOf<Int>()
+        var current = offset
+        repeat(count) {
+            if (current + 1 >= response.size) return@repeat
+            val value =
+                ((response[current].toInt() and 0xFF) shl 8) or (response[current + 1].toInt() and 0xFF)
+            codes += value
+            current += 2
+        }
+        return codes
     }
 }

@@ -46,10 +46,21 @@ import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 
+private const val MAX_SELECTABLE_SYSTEMS = 4
+private const val MAX_SELECTABLE_SERVICES = 4
+private const val WRITE_BLOCK_LIMIT = 12
+private const val BLOCK_BYTES = 16
+
 private enum class ReaderStage { Idle, AwaitingSource, AwaitingWrite }
 private enum class WizardStep { AwaitRead, SystemSelect, ServiceSelect, ReadyToWrite }
 
 private data class TrimPrompt(val serviceCode: Int, val blockCount: Int)
+
+private sealed interface WritePlanResult {
+    data class Ready(val image: SiliCaImage) : WritePlanResult
+    data class NeedsTrim(val serviceCode: Int, val blockCount: Int) : WritePlanResult
+    data class Invalid(val reason: String) : WritePlanResult
+}
 
 class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var nfcAdapter: NfcAdapter? = null
@@ -125,137 +136,170 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         }
     }
 
+    private fun <T> launchNfcTask(
+        busyMessage: String,
+        action: suspend () -> Result<T>,
+        onResult: (Result<T>) -> Unit,
+    ) {
+        if (isBusy.value) return
+        isBusy.value = true
+        statusText.value = busyMessage
+        errorText.value = null
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = action()
+            withContext(Dispatchers.Main) {
+                isBusy.value = false
+                onResult(result)
+            }
+        }
+    }
+
+    private fun applyReadResult(dump: CardDump) {
+        cardDumpState.value = dump
+        selectionState.value = SelectionState(
+            selectedSystems = dump.systems.take(MAX_SELECTABLE_SYSTEMS).map { it.systemCode }
+                .toSet(),
+            selectedServices = dump.systems.firstOrNull()?.services?.take(1)
+                ?.map { it.primaryServiceCode }?.toSet() ?: emptySet(),
+            writeService = dump.systems.firstOrNull()?.services?.firstOrNull()?.primaryServiceCode
+        )
+        statusText.value = "読み取り完了。システムとサービスを選んでください。"
+        wizardStep.value = WizardStep.SystemSelect
+    }
+
     private fun startReadMode() {
         if (isBusy.value) return
         statusText.value = "FeliCa をかざしてください"
         errorText.value = null
+        awaitingWrite.value = false
+        trimPrompt.value = null
+        pendingImage = null
+        wizardStep.value = WizardStep.AwaitRead
         readerStage.value = ReaderStage.AwaitingSource
     }
 
     private fun readFromTag(tag: Tag) {
-        if (isBusy.value) return
-        isBusy.value = true
-        statusText.value = "読み取り中..."
-        errorText.value = null
-        lifecycleScope.launch(Dispatchers.IO) {
-            val result = runCatching { FelicaClient(tag).readCard() }
-            withContext(Dispatchers.Main) {
-                isBusy.value = false
+        launchNfcTask(
+            busyMessage = "読み取り中...",
+            action = { runCatching { FelicaClient(tag).readCard() } },
+            onResult = { result ->
                 readerStage.value = ReaderStage.Idle
                 if (result.isSuccess) {
-                    val dump = result.getOrThrow()
-                    cardDumpState.value = dump
-                    selectionState.value = SelectionState(
-                        selectedSystems = dump.systems.take(4).map { it.systemCode }.toSet(),
-                        selectedServices = dump.systems.firstOrNull()?.services?.take(1)
-                            ?.map { it.primaryServiceCode }?.toSet() ?: emptySet(),
-                        writeService = dump.systems.firstOrNull()?.services?.firstOrNull()?.primaryServiceCode
-                    )
-                    statusText.value = "読み取り完了。システムとサービスを選んでください。"
-                    wizardStep.value = WizardStep.SystemSelect
+                    applyReadResult(result.getOrThrow())
                 } else {
                     errorText.value = "読み取りに失敗しました: ${result.exceptionOrNull()?.message}"
                     statusText.value = "カードを読み取ってください"
                 }
             }
-        }
+        )
     }
 
     private fun requestWriteFlow(trimAllowed: Boolean) {
         pendingImage = null
         awaitingWrite.value = false
+        trimPrompt.value = null
         val card = cardDumpState.value ?: run {
             statusText.value = "先にFeliCaを読み取ってください"
             return
         }
-        val selection = selectionState.value
-        val systems = if (selection.selectedSystems.isNotEmpty()) {
-            selection.selectedSystems
-        } else {
-            card.systems.take(4).map { it.systemCode }.toSet()
-        }
-        if (systems.size > 4) {
-            statusText.value = "システムは最大4つまで選択できます"
-            return
-        }
 
-        val systemsForWrite =
-            card.systems.filter { systems.contains(it.systemCode) }.ifEmpty { card.systems }
-        val selectedServiceCodes =
-            if (selection.selectedServices.isNotEmpty()) selection.selectedServices else emptySet()
-        val allServices = systemsForWrite.flatMap { it.services }
-        val servicesForWrite = if (selectedServiceCodes.isNotEmpty()) {
-            allServices.filter { selectedServiceCodes.contains(it.primaryServiceCode) }
-        } else {
-            allServices
-        }
-        if (servicesForWrite.isEmpty()) {
-            statusText.value = "サービス情報が取得できませんでした"
-            return
-        }
+        when (val plan = buildWritePlan(card, selectionState.value, trimAllowed)) {
+            is WritePlanResult.Ready -> {
+                pendingImage = plan.image
+                awaitingWrite.value = true
+                statusText.value = "SiliCa をかざしてください"
+                readerStage.value = ReaderStage.AwaitingWrite
+                wizardStep.value = WizardStep.ReadyToWrite
+            }
 
-        val serviceCodesFromSystems = mutableListOf<Int>().apply {
-            servicesForWrite.forEach { svc ->
-                svc.serviceCodes.forEach { code ->
-                    if (!contains(code)) add(code)
-                }
+            is WritePlanResult.NeedsTrim -> {
+                trimPrompt.value = TrimPrompt(plan.serviceCode, plan.blockCount)
+            }
+
+            is WritePlanResult.Invalid -> {
+                statusText.value = plan.reason
             }
         }
-        if (serviceCodesFromSystems.size > 4) {
-            statusText.value = "選択されたシステムに含まれるサービスコードが多すぎます（最大4）"
-            return
+    }
+
+    private fun buildWritePlan(
+        card: CardDump,
+        selection: SelectionState,
+        trimAllowed: Boolean
+    ): WritePlanResult {
+        val systemSelection = if (selection.selectedSystems.isNotEmpty()) {
+            selection.selectedSystems
+        } else {
+            card.systems.take(MAX_SELECTABLE_SYSTEMS).map { it.systemCode }.toSet()
+        }
+        if (systemSelection.size > MAX_SELECTABLE_SYSTEMS) {
+            return WritePlanResult.Invalid("システムは${MAX_SELECTABLE_SYSTEMS}つまで選択できます")
+        }
+
+        val systemsForWrite = card.systems
+            .filter { systemSelection.contains(it.systemCode) }
+            .take(MAX_SELECTABLE_SYSTEMS)
+            .ifEmpty { card.systems }
+
+        val servicesPool = systemsForWrite.flatMap { it.services }
+        val servicesForWrite = if (selection.selectedServices.isNotEmpty()) {
+            servicesPool.filter { selection.selectedServices.contains(it.primaryServiceCode) }
+        } else {
+            servicesPool
+        }
+        if (servicesForWrite.isEmpty()) {
+            return WritePlanResult.Invalid("サービス情報が取得できませんでした")
         }
 
         val targetServiceCode = selection.writeService
-            ?.takeIf { svc -> servicesForWrite.any { it.primaryServiceCode == svc } }
+            ?.takeIf { code -> servicesForWrite.any { it.primaryServiceCode == code } }
             ?: servicesForWrite.firstOrNull()?.primaryServiceCode
-            ?: run {
-                statusText.value = "書き込むサービスを1つ選択してください"
-                return
-            }
+            ?: return WritePlanResult.Invalid("書き込むサービスを1つ選択してください")
 
-        val serviceCodeSetForWrite = serviceCodesFromSystems.toMutableList()
-        if (!serviceCodeSetForWrite.contains(targetServiceCode)) {
-            serviceCodeSetForWrite.add(0, targetServiceCode)
+        val serviceCodesForImage = servicesForWrite
+            .flatMap { it.serviceCodes }
+            .distinct()
+            .toMutableList()
+        if (!serviceCodesForImage.contains(targetServiceCode)) {
+            serviceCodesForImage.add(0, targetServiceCode)
+        }
+        if (serviceCodesForImage.size > MAX_SELECTABLE_SERVICES) {
+            return WritePlanResult.Invalid("選択されたシステムに含まれるサービスコードが多すぎます（最大${MAX_SELECTABLE_SERVICES}）")
         }
 
-        val serviceDump =
+        val targetService =
             servicesForWrite.firstOrNull { it.primaryServiceCode == targetServiceCode }
-                ?: run {
-                    statusText.value = "選択したサービスのデータがありません"
-                    return
-                }
+                ?: return WritePlanResult.Invalid("選択したサービスのデータがありません")
 
-        if (serviceDump.blocks.isEmpty()) {
-            statusText.value = "ブロックデータが取得できていません"
-            return
+        if (targetService.blocks.isEmpty()) {
+            return WritePlanResult.Invalid("ブロックデータが取得できていません")
+        }
+        if (targetService.blockCount > WRITE_BLOCK_LIMIT && !trimAllowed) {
+            return WritePlanResult.NeedsTrim(
+                targetService.primaryServiceCode,
+                targetService.blockCount
+            )
         }
 
-        if (serviceDump.blockCount > 12 && !trimAllowed) {
-            trimPrompt.value = TrimPrompt(serviceDump.primaryServiceCode, serviceDump.blockCount)
-            return
-        }
-
-        val trimmedBlocks = serviceDump.blocks.take(12).map { it.data }
-        val paddedBlocks = if (trimmedBlocks.size < 12) {
-            trimmedBlocks + List(12 - trimmedBlocks.size) { ByteArray(16) }
+        val trimmedBlocks = targetService.blocks.take(WRITE_BLOCK_LIMIT).map { it.data }
+        val paddedBlocks = if (trimmedBlocks.size < WRITE_BLOCK_LIMIT) {
+            trimmedBlocks + List(WRITE_BLOCK_LIMIT - trimmedBlocks.size) { ByteArray(BLOCK_BYTES) }
         } else {
             trimmedBlocks
         }
-        val serviceCodesForImage = serviceCodeSetForWrite.take(4)
-        val systemCodesForImage = systems.take(4).toList()
-        pendingImage = SiliCaImage(
-            idm = card.idm,
-            pmm = card.pmm,
-            systemCodes = systemCodesForImage,
-            serviceCodes = serviceCodesForImage,
-            blocks = paddedBlocks,
+
+        val systemsForImage = systemsForWrite.take(MAX_SELECTABLE_SYSTEMS).map { it.systemCode }
+        val servicesForImage = serviceCodesForImage.take(MAX_SELECTABLE_SERVICES)
+
+        return WritePlanResult.Ready(
+            SiliCaImage(
+                idm = card.idm,
+                pmm = card.pmm,
+                systemCodes = systemsForImage,
+                serviceCodes = servicesForImage,
+                blocks = paddedBlocks,
+            )
         )
-        trimPrompt.value = null
-        awaitingWrite.value = true
-        statusText.value = "SiliCa をかざしてください"
-        readerStage.value = ReaderStage.AwaitingWrite
-        wizardStep.value = WizardStep.ReadyToWrite
     }
 
     private fun stepBack() {
@@ -268,14 +312,10 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
     private fun writeToSiliCa(tag: Tag) {
         val image = pendingImage ?: return
-        if (isBusy.value) return
-        isBusy.value = true
-        statusText.value = "SiliCa に書き込み中..."
-        errorText.value = null
-        lifecycleScope.launch(Dispatchers.IO) {
-            val result = runCatching { FelicaClient(tag).writeSiliCa(image) }
-            withContext(Dispatchers.Main) {
-                isBusy.value = false
+        launchNfcTask(
+            busyMessage = "SiliCa に書き込み中...",
+            action = { runCatching { FelicaClient(tag).writeSiliCa(image) } },
+            onResult = { result ->
                 awaitingWrite.value = false
                 readerStage.value = ReaderStage.Idle
                 if (result.isSuccess) {
@@ -286,15 +326,15 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                     statusText.value = "もう一度お試しください"
                 }
             }
-        }
+        )
     }
 
     private fun toggleSystem(systemCode: Int, checked: Boolean) {
         val current = selectionState.value
         val updated = current.selectedSystems.toMutableSet()
         if (checked) {
-            if (!updated.contains(systemCode) && updated.size >= 4) {
-                statusText.value = "システムは4つまで選択できます"
+            if (!updated.contains(systemCode) && updated.size >= MAX_SELECTABLE_SYSTEMS) {
+                statusText.value = "システムは${MAX_SELECTABLE_SYSTEMS}つまで選択できます"
                 return
             }
             updated += systemCode
@@ -309,8 +349,8 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         val updated = current.selectedServices.toMutableSet()
         var writeService = current.writeService
         if (checked) {
-            if (!updated.contains(serviceCode) && updated.size >= 4) {
-                statusText.value = "サービスは4つまで選択できます"
+            if (!updated.contains(serviceCode) && updated.size >= MAX_SELECTABLE_SERVICES) {
+                statusText.value = "サービスは${MAX_SELECTABLE_SERVICES}つまで選択できます"
                 return
             }
             updated += serviceCode
@@ -326,8 +366,8 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private fun selectWriteService(serviceCode: Int) {
         val current = selectionState.value
         val updated = current.selectedServices.toMutableSet()
-        if (!updated.contains(serviceCode) && updated.size >= 4) {
-            statusText.value = "サービスは4つまで選択できます"
+        if (!updated.contains(serviceCode) && updated.size >= MAX_SELECTABLE_SERVICES) {
+            statusText.value = "サービスは${MAX_SELECTABLE_SERVICES}つまで選択できます"
             return
         }
         updated += serviceCode
@@ -573,7 +613,7 @@ private fun SystemSelection(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("システム選択（最大4）", fontWeight = FontWeight.Bold)
+            Text("システム選択（最大${MAX_SELECTABLE_SYSTEMS}）", fontWeight = FontWeight.Bold)
             cardDump.systems.forEach { system ->
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -608,8 +648,8 @@ private fun ServiceSelection(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("サービス選択（最大4）", fontWeight = FontWeight.Bold)
-            Text("チェックボックス: SiliCaに登録するサービスコード（最大4）。")
+            Text("サービス選択（最大${MAX_SELECTABLE_SERVICES}）", fontWeight = FontWeight.Bold)
+            Text("チェックボックス: SiliCaに登録するサービスコード（最大${MAX_SELECTABLE_SERVICES}）。")
             Text("ラジオボタン: ブロックを書き込むサービスコード（1つ）。")
             var hasService = false
             systemsToShow.forEach { system ->
