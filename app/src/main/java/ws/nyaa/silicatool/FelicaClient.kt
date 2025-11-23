@@ -69,17 +69,32 @@ class FelicaClient(private val tag: Tag) {
             writeBlock(idm, 0x84, buildServiceBlock(image.serviceCodes))
             writeBlock(idm, 0x85, buildSystemBlock(image.systemCodes))
 
-            image.blocks.take(WRITE_MAX_BLOCKS).forEachIndexed { index, bytes ->
-                if (bytes.size != BLOCK_SIZE) {
-                    throw IOException("ブロック${index}のサイズが16バイトではありません")
-                }
-                writeBlock(idm, index, bytes)
+            val blocksToWrite = image.blocks.take(WRITE_MAX_BLOCKS)
+            if (blocksToWrite.isNotEmpty()) {
+                val blockNumbers = blocksToWrite.indices.toList()
+                writeBlocks(idm, blockNumbers, blocksToWrite)
             }
         }
     }
 
     private fun writeBlock(idm: ByteArray, blockNumber: Int, data: ByteArray) {
-        val frame = buildWriteCommand(idm, blockNumber, data)
+        writeBlocks(idm, listOf(blockNumber), listOf(data))
+    }
+
+    private fun writeBlocks(idm: ByteArray, blockNumbers: List<Int>, blocks: List<ByteArray>) {
+        if (blockNumbers.isEmpty()) return
+        if (blockNumbers.size != blocks.size) {
+            throw IOException("ブロック番号とデータ数が一致しません")
+        }
+        if (blockNumbers.size > WRITE_MAX_BLOCKS) {
+            throw IOException("書き込みブロック数が上限を超えています: ${blocks.size}")
+        }
+        blocks.forEachIndexed { index, payload ->
+            if (payload.size != BLOCK_SIZE) {
+                throw IOException("ブロック${blockNumbers[index]}のサイズが16バイトではありません")
+            }
+        }
+        val frame = buildWriteCommand(idm, blockNumbers, blocks)
         val response = transceive(frame)
         if (response.size < 12 || response[1].toInt() != 0x09) {
             throw IOException("書き込みレスポンスが不正です")
@@ -275,11 +290,29 @@ class FelicaClient(private val tag: Tag) {
         return result
     }
 
-    private fun buildWriteCommand(idm: ByteArray, blockNumber: Int, payload: ByteArray): ByteArray {
+    private fun buildWriteCommand(
+        idm: ByteArray,
+        blockNumbers: List<Int>,
+        payloads: List<ByteArray>
+    ): ByteArray {
+        if (blockNumbers.size != payloads.size) {
+            throw IllegalArgumentException("ブロック数とペイロード数が一致しません")
+        }
         val serviceCode = SERVICE_CODE_SYSTEM_BLOCK
         val serviceCodeLe =
             byteArrayOf((serviceCode and 0xFF).toByte(), ((serviceCode shr 8) and 0xFF).toByte())
-        val blockList = byteArrayOf((0x80 or 0x00).toByte(), blockNumber.toByte())
+        val blockList = ByteArray(blockNumbers.size * 2)
+        var blockListOffset = 0
+        blockNumbers.forEach { blockNumber ->
+            blockList[blockListOffset++] = (0x80 or 0x00).toByte()
+            blockList[blockListOffset++] = blockNumber.toByte()
+        }
+        val payload = ByteArray(payloads.size * BLOCK_SIZE)
+        var payloadOffset = 0
+        payloads.forEach { bytes ->
+            System.arraycopy(bytes, 0, payload, payloadOffset, bytes.size)
+            payloadOffset += bytes.size
+        }
 
         val body = ByteArray(1 + 8 + 1 + 2 + 1 + blockList.size + payload.size)
         var offset = 0
@@ -289,7 +322,7 @@ class FelicaClient(private val tag: Tag) {
         body[offset++] = 0x01
         System.arraycopy(serviceCodeLe, 0, body, offset, 2)
         offset += 2
-        body[offset++] = 0x01
+        body[offset++] = blockNumbers.size.toByte()
         System.arraycopy(blockList, 0, body, offset, blockList.size)
         offset += blockList.size
         System.arraycopy(payload, 0, body, offset, payload.size)
