@@ -14,16 +14,6 @@ private const val READ_MAX_BLOCKS = 0xFFFF
 private const val WRITE_MAX_BLOCKS = 12
 private const val SERVICE_CODE_SYSTEM_BLOCK = 0xFFFF
 private const val DEFAULT_TIMEOUT_MS = 1000
-private val DEFAULT_PMM = byteArrayOf(
-    0x00,
-    0x01,
-    0xFF.toByte(),
-    0xFF.toByte(),
-    0xFF.toByte(),
-    0xFF.toByte(),
-    0xFF.toByte(),
-    0xFF.toByte()
-)
 private const val LOG_TAG = "FelicaClient"
 
 sealed interface SearchServiceResult {
@@ -301,12 +291,7 @@ class FelicaClient(private val tag: Tag) {
         val serviceCode = SERVICE_CODE_SYSTEM_BLOCK
         val serviceCodeLe =
             byteArrayOf((serviceCode and 0xFF).toByte(), ((serviceCode shr 8) and 0xFF).toByte())
-        val blockList = ByteArray(blockNumbers.size * 2)
-        var blockListOffset = 0
-        blockNumbers.forEach { blockNumber ->
-            blockList[blockListOffset++] = (0x80 or 0x00).toByte()
-            blockList[blockListOffset++] = blockNumber.toByte()
-        }
+        val blockList = buildBlockList(blockNumbers)
         val payload = ByteArray(payloads.size * BLOCK_SIZE)
         var payloadOffset = 0
         payloads.forEach { bytes ->
@@ -337,12 +322,7 @@ class FelicaClient(private val tag: Tag) {
     ): ByteArray {
         val serviceLe =
             byteArrayOf((serviceCode and 0xFF).toByte(), ((serviceCode shr 8) and 0xFF).toByte())
-        val blockList = ByteArray(blockNumbers.size * 2)
-        var pos = 0
-        blockNumbers.forEach { blockNumber ->
-            blockList[pos++] = (0x80 or 0x00).toByte()
-            blockList[pos++] = blockNumber.toByte()
-        }
+        val blockList = buildBlockList(blockNumbers)
 
         val body = ByteArray(1 + 8 + 1 + 2 + 1 + blockList.size)
         var offset = 0
@@ -440,5 +420,15 @@ class FelicaClient(private val tag: Tag) {
             current += 2
         }
         return codes
+    }
+
+    private fun buildBlockList(blockNumbers: List<Int>): ByteArray {
+        val blockList = ByteArray(blockNumbers.size * 2)
+        var offset = 0
+        blockNumbers.forEach { blockNumber ->
+            blockList[offset++] = (0x80 or 0x00).toByte()
+            blockList[offset++] = blockNumber.toByte()
+        }
+        return blockList
     }
 }
