@@ -43,6 +43,9 @@ fun MainScreen(
     onToggleService: (Int, Boolean) -> Unit,
     onSelectWriteService: (Int) -> Unit,
     onRequestWrite: () -> Unit,
+    onRequestIdmOnlyWrite: () -> Unit,
+    onSelectIdmSystem: (Int) -> Unit,
+    onSelectPmmMode: (PmmMode) -> Unit,
     onCancelTrim: () -> Unit,
     onConfirmTrim: () -> Unit,
     onShowServiceDetail: (ServiceDump) -> Unit,
@@ -82,6 +85,14 @@ fun MainScreen(
             val cardDump = state.cardDump
             if (cardDump != null && !isAwaitingRead) {
                 CardInfo(cardDump)
+                IdmOnlyWriteSection(
+                    cardDump = cardDump,
+                    selection = state.selection,
+                    onSelectIdmSystem = onSelectIdmSystem,
+                    onSelectPmmMode = onSelectPmmMode,
+                    onRequestIdmOnlyWrite = onRequestIdmOnlyWrite,
+                    enabled = !state.isBusy && !state.awaitingWrite,
+                )
                 when (state.wizardStep) {
                     WizardStep.AwaitRead -> {
                         Text("FeliCa を読み取ってください")
@@ -217,6 +228,87 @@ private fun CardInfo(cardDump: CardDump) {
             Text("IDm: ${cardDump.idm.toHexString()}")
             Text("PMm: ${cardDump.pmm.toHexString()}")
             Text("システムコード: ${cardDump.systems.joinToString { it.systemCode.toHexShort() }}")
+        }
+    }
+}
+
+@Composable
+private fun IdmOnlyWriteSection(
+    cardDump: CardDump,
+    selection: SelectionState,
+    onSelectIdmSystem: (Int) -> Unit,
+    onSelectPmmMode: (PmmMode) -> Unit,
+    onRequestIdmOnlyWrite: () -> Unit,
+    enabled: Boolean,
+) {
+    val background = MaterialTheme.colorScheme.surfaceVariant
+    val idmSystem = cardDump.systems.firstOrNull { it.systemCode == selection.idmWriteSystem }
+        ?: cardDump.systems.firstOrNull()
+    Card(
+        colors = CardDefaults.cardColors(containerColor = background),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("書き込むIDmの選択", fontWeight = FontWeight.Bold)
+            cardDump.systems.forEach { system ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    RadioButton(
+                        selected = selection.idmWriteSystem == system.systemCode,
+                        onClick = { onSelectIdmSystem(system.systemCode) }
+                    )
+                    Column {
+                        Text("システム ${system.systemCode.toHexShort()}")
+                        Text("IDm: ${system.idm.toHexString()}", fontSize = 14.sp)
+                    }
+                }
+            }
+            Button(
+                onClick = onRequestIdmOnlyWrite,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = enabled
+            ) {
+                Text("IDmのみ書き込む")
+            }
+            Text("PMmの選択", fontWeight = FontWeight.Bold)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                RadioButton(
+                    selected = selection.pmmMode == PmmMode.Read,
+                    onClick = { onSelectPmmMode(PmmMode.Read) }
+                )
+                Column {
+                    Text("読み取ったPMmを使用")
+                    Text(
+                        "PMm: ${idmSystem?.pmm?.toHexString().orEmpty()}",
+                        fontSize = 14.sp
+                    )
+                }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                RadioButton(
+                    selected = selection.pmmMode == PmmMode.Fixed,
+                    onClick = { onSelectPmmMode(PmmMode.Fixed) }
+                )
+                Column {
+                    Text("固定値を使用")
+                    Text(
+                        "PMm: ${FIXED_PMM.toHexString()}FFFFFFFFFFFF",
+                        fontSize = 14.sp
+                    )
+                }
+            }
+
         }
     }
 }

@@ -31,7 +31,11 @@ data class SelectionState(
     val selectedSystems: Set<Int> = emptySet(),
     val selectedServices: Set<Int> = emptySet(),
     val writeService: Int? = null,
+    val idmWriteSystem: Int? = null,
+    val pmmMode: PmmMode = PmmMode.Read,
 )
+
+val FIXED_PMM: ByteArray = byteArrayOf(0x00, 0x01)
 
 data class SiliCaImage(
     val idm: ByteArray,
