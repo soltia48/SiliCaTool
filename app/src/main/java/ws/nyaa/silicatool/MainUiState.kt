@@ -2,6 +2,8 @@ package ws.nyaa.silicatool
 
 enum class ReaderStage { Idle, AwaitingSource, AwaitingWrite }
 enum class WizardStep { AwaitRead, SystemSelect, ServiceSelect, ReadyToWrite }
+enum class WriteMode { Full, IdmOnly }
+enum class PmmMode { Read, Fixed }
 
 data class TrimPrompt(val serviceCode: Int, val blockCount: Int)
 

@@ -17,10 +17,12 @@ object WritePlanner {
             ?: emptySet()
         val defaultWriteService =
             card.systems.firstOrNull()?.services?.firstOrNull()?.primaryServiceCode
+        val defaultIdmSystem = card.systems.firstOrNull()?.systemCode
         return SelectionState(
             selectedSystems = defaultSystems,
             selectedServices = defaultServices,
-            writeService = defaultWriteService
+            writeService = defaultWriteService,
+            idmWriteSystem = defaultIdmSystem
         )
     }
 
@@ -93,10 +95,18 @@ object WritePlanner {
             systemsForWrite.take(WriteConstraints.maxSelectableSystems).map { it.systemCode }
         val servicesForImage = serviceCodesForImage.take(WriteConstraints.maxSelectableServices)
 
+        val idmSystem = card.systems.firstOrNull { it.systemCode == selection.idmWriteSystem }
+            ?: card.systems.firstOrNull()
+        val effectiveIdm = idmSystem?.idm ?: card.idm
+        val effectivePmm = when (selection.pmmMode) {
+            PmmMode.Read -> idmSystem?.pmm ?: card.pmm
+            PmmMode.Fixed -> FIXED_PMM
+        }
+
         return WritePlanResult.Ready(
             SiliCaImage(
-                idm = card.idm,
-                pmm = card.pmm,
+                idm = effectiveIdm,
+                pmm = effectivePmm,
                 systemCodes = systemsForImage,
                 serviceCodes = servicesForImage,
                 blocks = paddedBlocks,

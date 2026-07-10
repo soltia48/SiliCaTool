@@ -67,6 +67,14 @@ class FelicaClient(private val tag: Tag) {
         }
     }
 
+    fun writeIdmOnly(idm: ByteArray, pmm: ByteArray) {
+        withConnection {
+            val tagIdm = tag.id
+            if (tagIdm.size != 8) throw IOException("IDm 長が不正です")
+            writeBlock(tagIdm, 0x83, buildIdmBlock(idm, pmm))
+        }
+    }
+
     private fun writeBlock(idm: ByteArray, blockNumber: Int, data: ByteArray) {
         writeBlocks(idm, listOf(blockNumber), listOf(data))
     }

@@ -18,6 +18,8 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var nfcAdapter: NfcAdapter? = null
     private val uiState = mutableStateOf(MainUiState())
     private var pendingImage: SiliCaImage? = null
+    private var pendingIdmOnly: Pair<ByteArray, ByteArray>? = null
+    private var pendingWriteMode: WriteMode = WriteMode.Full
     private var nfcTaskToken = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -37,6 +39,9 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                     onToggleService = ::toggleService,
                     onSelectWriteService = ::selectWriteService,
                     onRequestWrite = { requestWriteFlow(trimAllowed = false) },
+                    onRequestIdmOnlyWrite = ::requestIdmOnlyWriteFlow,
+                    onSelectIdmSystem = ::selectIdmSystem,
+                    onSelectPmmMode = ::selectPmmMode,
                     onCancelTrim = { updateState { copy(trimPrompt = null) } },
                     onConfirmTrim = { requestWriteFlow(trimAllowed = true) },
                     onShowServiceDetail = { updateState { copy(serviceDetail = it) } },
@@ -114,6 +119,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
     private fun requestWriteFlow(trimAllowed: Boolean) {
         pendingImage = null
+        pendingIdmOnly = null
         updateState { copy(awaitingWrite = false, trimPrompt = null) }
 
         val card = uiState.value.cardDump ?: run {
@@ -123,6 +129,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
         when (val plan = WritePlanner.build(card, uiState.value.selection, trimAllowed)) {
             is WritePlanResult.Ready -> {
+                pendingWriteMode = WriteMode.Full
                 pendingImage = plan.image
                 updateState {
                     copy(
@@ -141,6 +148,40 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             is WritePlanResult.Invalid -> {
                 updateState { copy(status = plan.reason) }
             }
+        }
+    }
+
+    private fun requestIdmOnlyWriteFlow() {
+        pendingImage = null
+        pendingIdmOnly = null
+        updateState { copy(awaitingWrite = false, trimPrompt = null) }
+
+        val card = uiState.value.cardDump ?: run {
+            updateState { copy(status = "先にFeliCaを読み取ってください") }
+            return
+        }
+
+        val systemCode = uiState.value.selection.idmWriteSystem
+        val system = card.systems.firstOrNull { it.systemCode == systemCode }
+            ?: card.systems.firstOrNull()
+            ?: run {
+                updateState { copy(status = "システム情報が取得できませんでした") }
+                return
+            }
+
+        val effectivePmm = when (uiState.value.selection.pmmMode) {
+            PmmMode.Read -> system.pmm
+            PmmMode.Fixed -> FIXED_PMM
+        }
+
+        pendingWriteMode = WriteMode.IdmOnly
+        pendingIdmOnly = system.idm to effectivePmm
+        updateState {
+            copy(
+                awaitingWrite = true,
+                status = "SiliCa をかざしてください（IDmのみ書き込みます）",
+                readerStage = ReaderStage.AwaitingWrite,
+            )
         }
     }
 
@@ -168,6 +209,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                     uiState.value.isBusy
         nfcTaskToken++
         pendingImage = null
+        pendingIdmOnly = null
         updateState {
             copy(
                 awaitingWrite = false,
@@ -180,6 +222,13 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     }
 
     private fun writeToSiliCa(tag: Tag) {
+        when (pendingWriteMode) {
+            WriteMode.Full -> writeFullImage(tag)
+            WriteMode.IdmOnly -> writeIdmOnly(tag)
+        }
+    }
+
+    private fun writeFullImage(tag: Tag) {
         val image = pendingImage ?: return
         launchNfcTask(
             busyMessage = "SiliCa に書き込み中...",
@@ -189,6 +238,28 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 if (result.isSuccess) {
                     pendingImage = null
                     updateState { copy(status = "書き込みが完了しました") }
+                } else {
+                    updateState {
+                        copy(
+                            error = "書き込みに失敗しました: ${result.exceptionOrNull()?.message}",
+                            status = "もう一度お試しください"
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun writeIdmOnly(tag: Tag) {
+        val (idm, pmm) = pendingIdmOnly ?: return
+        launchNfcTask(
+            busyMessage = "IDm を書き込み中...",
+            action = { runCatching { FelicaClient(tag).writeIdmOnly(idm, pmm) } },
+            onResult = { result ->
+                updateState { copy(awaitingWrite = false, readerStage = ReaderStage.Idle) }
+                if (result.isSuccess) {
+                    pendingIdmOnly = null
+                    updateState { copy(status = "IDm の書き込みが完了しました") }
                 } else {
                     updateState {
                         copy(
@@ -258,6 +329,16 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 )
             )
         }
+    }
+
+    private fun selectIdmSystem(systemCode: Int) {
+        val current = uiState.value.selection
+        updateState { copy(selection = current.copy(idmWriteSystem = systemCode)) }
+    }
+
+    private fun selectPmmMode(mode: PmmMode) {
+        val current = uiState.value.selection
+        updateState { copy(selection = current.copy(pmmMode = mode)) }
     }
 
     private fun enableReaderMode() {
